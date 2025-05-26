@@ -459,6 +459,50 @@ static bool unsubscribeFromRegisterThingResponseTopics( void )
 }
 /*-----------------------------------------------------------*/
 
+/**
+ * @brief Helper function to find a PKCS#11 object by its label and type.
+ *
+ * @param[in] session The PKCS#11 session handle.
+ * @param[in] pLabel The label of the object to find.
+ * @param[in] objectClass The class of the object to find (e.g., CKO_CERTIFICATE).
+ *
+ * @return The object handle if found, otherwise CK_INVALID_HANDLE.
+ */
+static CK_OBJECT_HANDLE findPkcs11Object( CK_SESSION_HANDLE session,
+                                          const char * pLabel,
+                                          CK_OBJECT_CLASS objectClass )
+{
+    CK_RV pkcs11Ret = CKR_OK;
+    CK_ATTRIBUTE searchTemplate[] =
+    {
+        { CKA_LABEL, ( CK_VOID_PTR ) pLabel, strlen( pLabel ) },
+        { CKA_CLASS, &objectClass, sizeof( CK_OBJECT_CLASS ) }
+    };
+    CK_OBJECT_HANDLE objectHandle = CK_INVALID_HANDLE;
+    CK_ULONG objectCount = 0;
+
+    pkcs11Ret = C_FindObjectsInit( session, searchTemplate, sizeof( searchTemplate ) / sizeof( CK_ATTRIBUTE ) );
+
+    if( pkcs11Ret == CKR_OK )
+    {
+        pkcs11Ret = C_FindObjects( session, &objectHandle, 1, &objectCount );
+    }
+
+    if( pkcs11Ret == CKR_OK )
+    {
+        pkcs11Ret = C_FindObjectsFinal( session );
+    }
+
+    if( ( pkcs11Ret == CKR_OK ) && ( objectCount > 0 ) )
+    {
+        return objectHandle;
+    }
+
+    return CK_INVALID_HANDLE;
+}
+
+/*-----------------------------------------------------------*/
+
 /* This example uses a single application task, which shows that how to use
  * the Fleet Provisioning library to generate and validate AWS IoT Fleet
  * Provisioning MQTT topics, and use the coreMQTT library to communicate with
@@ -483,6 +527,7 @@ int aws_iot_demo_main( int argc,
     CK_SESSION_HANDLE p11Session;
     int demoRunCount = 0;
     CK_RV pkcs11ret = CKR_OK;
+    CK_OBJECT_HANDLE deviceCertificateHandle = CK_INVALID_HANDLE;
 
     /* Silence compiler warnings about unused variables. */
     ( void ) argc;
@@ -505,28 +550,59 @@ int aws_iot_demo_main( int argc,
         }
         else
         {
-            /* Insert the claim credentials into the PKCS #11 module */
-            status = loadClaimCredentials( p11Session,
-                                           CLAIM_CERT_PATH,
-                                           pkcs11configLABEL_CLAIM_CERTIFICATE,
-                                           CLAIM_PRIVATE_KEY_PATH,
-                                           pkcs11configLABEL_CLAIM_PRIVATE_KEY );
+            /* Check if a device certificate already exists. */
+            LogInfo( ( "Checking for existing device certificate..." ) );
+            deviceCertificateHandle = findPkcs11Object( p11Session, pkcs11configLABEL_DEVICE_CERTIFICATE_FOR_TLS, CKO_CERTIFICATE );
 
-            if( status == false )
+            if( deviceCertificateHandle != CK_INVALID_HANDLE )
             {
-                LogError( ( "Failed to provision PKCS #11 with claim credentials." ) );
+                LogInfo( ( "Found existing device certificate. Attempting to connect..." ) );
+                status = EstablishMqttSession( provisioningPublishCallback,
+                                               p11Session,
+                                               pkcs11configLABEL_DEVICE_CERTIFICATE_FOR_TLS,
+                                               pkcs11configLABEL_DEVICE_PRIVATE_KEY_FOR_TLS );
+
+                if( status == true )
+                {
+                    LogInfo( ( "Successfully established MQTT session with existing device certificate." ) );
+                    connectionEstablished = true;
+                    /* Skip to the end of the loop as provisioning is not needed. */
+                    goto démo_finish;
+                }
+                else
+                {
+                    LogError( ( "Failed to establish MQTT session with existing device certificate. Proceeding with provisioning." ) );
+                    /* Reset status to continue with provisioning. */
+                    status = true; /* Assuming we want to try provisioning if existing cert fails. */
+                                   /* If not, this should be false and handled accordingly. */
+                }
+            }
+            else
+            {
+                LogInfo( ( "No existing device certificate found. Proceeding with provisioning." ) );
+                /* Insert the claim credentials into the PKCS #11 module */
+                status = loadClaimCredentials( p11Session,
+                                               CLAIM_CERT_PATH,
+                                               pkcs11configLABEL_CLAIM_CERTIFICATE,
+                                               CLAIM_PRIVATE_KEY_PATH,
+                                               pkcs11configLABEL_CLAIM_PRIVATE_KEY );
+
+                if( status == false )
+                {
+                    LogError( ( "Failed to provision PKCS #11 with claim credentials." ) );
+                }
             }
         }
 
-        /**** Connect to AWS IoT Core with provisioning claim credentials *****/
-
-        /* We first use the claim credentials to connect to the broker. These
-         * credentials should allow use of the RegisterThing API and one of the
-         * CreateCertificatefromCsr or CreateKeysAndCertificate.
-         * In this demo we use CreateCertificatefromCsr. */
-
-        if( status == true )
+        if (status == true && deviceCertificateHandle == CK_INVALID_HANDLE)
         {
+            /**** Connect to AWS IoT Core with provisioning claim credentials *****/
+
+            /* We first use the claim credentials to connect to the broker. These
+             * credentials should allow use of the RegisterThing API and one of the
+             * CreateCertificatefromCsr or CreateKeysAndCertificate.
+             * In this demo we use CreateCertificatefromCsr. */
+
             /* Attempts to connect to the AWS IoT MQTT broker. If the
              * connection fails, retries after a timeout. Timeout value will
              * exponentially increase until maximum attempts are reached. */
@@ -548,19 +624,18 @@ int aws_iot_demo_main( int argc,
         }
 
         /**** Call the CreateCertificateFromCsr API ***************************/
-
-        /* We use the CreateCertificatefromCsr API to obtain a client certificate
-         * for a key on the device by means of sending a certificate signing
-         * request (CSR). */
-        if( status == true )
+        if (status == true && deviceCertificateHandle == CK_INVALID_HANDLE)
         {
+            /* We use the CreateCertificatefromCsr API to obtain a client certificate
+             * for a key on the device by means of sending a certificate signing
+             * request (CSR). */
             /* Subscribe to the CreateCertificateFromCsr accepted and rejected
              * topics. In this demo we use CBOR encoding for the payloads,
              * so we use the CBOR variants of the topics. */
             status = subscribeToCsrResponseTopics();
         }
 
-        if( status == true )
+        if( status == true && deviceCertificateHandle == CK_INVALID_HANDLE )
         {
             /* Create a new key and CSR. */
             status = generateKeyAndCsr( p11Session,
@@ -571,7 +646,7 @@ int aws_iot_demo_main( int argc,
                                         &csrLength );
         }
 
-        if( status == true )
+        if( status == true && deviceCertificateHandle == CK_INVALID_HANDLE )
         {
             /* Create the request payload containing the CSR to publish to the
              * CreateCertificateFromCsr APIs. */
@@ -582,7 +657,7 @@ int aws_iot_demo_main( int argc,
                                          &payloadLength );
         }
 
-        if( status == true )
+        if( status == true && deviceCertificateHandle == CK_INVALID_HANDLE )
         {
             /* Publish the CSR to the CreateCertificatefromCsr API. */
             PublishToTopic( FP_CBOR_CREATE_CERT_PUBLISH_TOPIC,
@@ -598,13 +673,13 @@ int aws_iot_demo_main( int argc,
             }
         }
 
-        if( status == true )
+        if( status == true && deviceCertificateHandle == CK_INVALID_HANDLE )
         {
             /* Get the response to the CreateCertificatefromCsr request. */
             status = waitForResponse();
         }
 
-        if( status == true )
+        if( status == true && deviceCertificateHandle == CK_INVALID_HANDLE )
         {
             /* From the response, extract the certificate, certificate ID, and
              * certificate ownership token. */
@@ -623,7 +698,7 @@ int aws_iot_demo_main( int argc,
             }
         }
 
-        if( status == true )
+        if( status == true && deviceCertificateHandle == CK_INVALID_HANDLE )
         {
             /* Save the certificate into PKCS #11. */
             status = loadCertificate( p11Session,
@@ -632,19 +707,18 @@ int aws_iot_demo_main( int argc,
                                       certificateLength );
         }
 
-        if( status == true )
+        if( status == true && deviceCertificateHandle == CK_INVALID_HANDLE )
         {
             /* Unsubscribe from the CreateCertificateFromCsr topics. */
             status = unsubscribeFromCsrResponseTopics();
         }
 
         /**** Call the RegisterThing API **************************************/
-
+        if (status == true && deviceCertificateHandle == CK_INVALID_HANDLE)
+        {
         /* We then use the RegisterThing API to activate the received certificate,
          * provision AWS IoT resources according to the provisioning template, and
          * receive device configuration. */
-        if( status == true )
-        {
             /* Create the request payload to publish to the RegisterThing API. */
             status = generateRegisterThingRequest( payloadBuffer,
                                                    NETWORK_BUFFER_SIZE,
@@ -655,13 +729,13 @@ int aws_iot_demo_main( int argc,
                                                    &payloadLength );
         }
 
-        if( status == true )
+        if( status == true && deviceCertificateHandle == CK_INVALID_HANDLE )
         {
             /* Subscribe to the RegisterThing response topics. */
             status = subscribeToRegisterThingResponseTopics();
         }
 
-        if( status == true )
+        if( status == true && deviceCertificateHandle == CK_INVALID_HANDLE )
         {
             /* Publish the RegisterThing request. */
             PublishToTopic( FP_CBOR_REGISTER_PUBLISH_TOPIC( PROVISIONING_TEMPLATE_NAME ),
@@ -677,13 +751,13 @@ int aws_iot_demo_main( int argc,
             }
         }
 
-        if( status == true )
+        if( status == true && deviceCertificateHandle == CK_INVALID_HANDLE )
         {
             /* Get the response to the RegisterThing request. */
             status = waitForResponse();
         }
 
-        if( status == true )
+        if( status == true && deviceCertificateHandle == CK_INVALID_HANDLE )
         {
             /* Extract the Thing name from the response. */
             thingNameLength = MAX_THING_NAME_LENGTH;
@@ -698,29 +772,30 @@ int aws_iot_demo_main( int argc,
             }
         }
 
-        if( status == true )
+        if( status == true && deviceCertificateHandle == CK_INVALID_HANDLE )
         {
             /* Unsubscribe from the RegisterThing topics. */
             unsubscribeFromRegisterThingResponseTopics();
         }
 
         /**** Disconnect from AWS IoT Core ************************************/
-
-        /* As we have completed the provisioning workflow, we disconnect from
-         * the connection using the provisioning claim credentials. We will
-         * establish a new MQTT connection with the newly provisioned
-         * credentials. */
-        if( connectionEstablished == true )
+        /* This applies if we connected with claim credentials and provisioned a new cert. */
+        if( connectionEstablished == true && deviceCertificateHandle == CK_INVALID_HANDLE )
         {
             DisconnectMqttSession();
-            connectionEstablished = false;
+            connectionEstablished = false; /* Reset for the next potential connection attempt */
         }
 
         /**** Connect to AWS IoT Core with provisioned certificate ************/
-
-        if( status == true )
+        /* This section is reached if:
+         * 1. Provisioning was just completed (deviceCertificateHandle was CK_INVALID_HANDLE).
+         * OR
+         * 2. We are in a retry loop AND initial check for existing certificate failed, then provisioning failed,
+         *    and we are retrying the whole demo loop. (This case needs careful handling of 'status').
+         */
+        if( status == true && deviceCertificateHandle == CK_INVALID_HANDLE )
         {
-            LogInfo( ( "Establishing MQTT session with provisioned certificate..." ) );
+            LogInfo( ( "Establishing MQTT session with newly provisioned certificate..." ) );
             status = EstablishMqttSession( provisioningPublishCallback,
                                            p11Session,
                                            pkcs11configLABEL_DEVICE_CERTIFICATE_FOR_TLS,
@@ -731,15 +806,16 @@ int aws_iot_demo_main( int argc,
                 LogError( ( "Failed to establish MQTT session with provisioned "
                             "credentials. Verify on your AWS account that the "
                             "new certificate is active and has an attached IoT "
-                            "Policy that allows the \"iot:Connect\" action." ) );
+                            "Policy that allows the iot:Connect action." ) );
             }
             else
             {
-                LogInfo( ( "Sucessfully established connection with provisioned credentials." ) );
+                LogInfo( ( "Sucessfully established connection with newly provisioned credentials." ) );
                 connectionEstablished = true;
             }
         }
 
+démo_finish:
         /**** Finish **********************************************************/
 
         if( connectionEstablished == true )
